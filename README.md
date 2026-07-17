@@ -9,7 +9,7 @@ TabPFN — perform both **static** and **dynamic** survival analysis through
 in-context learning, with no survival-specific pretraining. This repository
 reproduces the static and dynamic experiments in the paper.
 
-📄 Paper: [arXiv:2601.22259](https://arxiv.org/abs/2601.22259) *(under review at TMLR)*
+📄 Paper: [arXiv:2601.22259](https://arxiv.org/abs/2601.22259) *(under submission)*
 
 ---
 
