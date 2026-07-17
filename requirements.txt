@@ -1,0 +1,31 @@
+# Python dependencies for the static and dynamic survival experiments.
+# Tested with Python 3.9. Install with:  pip install -r requirements.txt
+#
+# Core scientific stack
+numpy==2.0.2
+pandas==2.3.2
+scipy==1.13.1
+matplotlib==3.9.4
+
+# Machine learning / survival analysis
+scikit-learn==1.5.2
+scikit-survival==0.23.1        # imported as `sksurv`
+xgboost==2.1.4
+torch==2.7.0
+pycox==0.3.0                   # dynamic / discrete-time neural baselines
+torchtuples==0.2.2             # pycox dependency
+
+# Tabular foundation models
+tabpfn==2.1.0
+autogluon.tabular>=1.2         # provides the MITRA tabular foundation model
+                               # (install the full `autogluon` if preferred)
+
+# Utilities
+elote>=1.1.0                   # ELO rating aggregation in the analysis scripts
+
+# ---------------------------------------------------------------------------
+# NOT on PyPI / installed separately:
+#   * ddh/    -- Dynamic-DeepHit implementation, bundled locally under dynamic/ddh
+#   * R + the `JM` package    -- required only for dynamic/dynamic_jm.R
+#     install.packages("JM")   (also needs `survival`, `nlme`)
+# ---------------------------------------------------------------------------
