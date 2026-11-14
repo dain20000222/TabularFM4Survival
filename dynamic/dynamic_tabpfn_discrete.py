@@ -19,6 +19,7 @@ import warnings
 import random
 import csv
 import torch
+from sksurv.nonparametric import kaplan_meier_estimator
 
 warnings.filterwarnings("ignore")
 
@@ -31,8 +32,11 @@ warnings.filterwarnings("ignore")
 # =============================================================================
 
 # Parse command line arguments
-parser = argparse.ArgumentParser(description='Run dynamic TabPFN with different k values for landmark quantiles')
+parser = argparse.ArgumentParser(description='Run dynamic TabPFN with different landmark binning strategies')
 parser.add_argument('--k', type=float, default=20, help='Step size for landmark time percentiles (default: 20)')
+parser.add_argument('--binning', type=str, default='km_quantile', choices=['quantile', 'km_quantile', 'pooled'],
+                    help='Landmark binning strategy: quantile or km_quantile (default: km_quantile)')
+parser.add_argument('--oof_folds', type=int, default=0, help='DOOF: folds of the out-of-fold predictions of the training patients (0: none)')
 args = parser.parse_args()
 
 # =============================================================================
@@ -58,11 +62,13 @@ data_dir = os.path.join("data_mean")
 dataset_files = [f for f in os.listdir(data_dir) if f.endswith(".csv")]
 
 # Output file path for risk prediction results
-risk_out_path = f"dynamic_tabpfn_discrete_risk_{args.k}.csv"
+binning_suffix = f"_{args.binning}" if args.binning != "quantile" else ""
+k_token = f"{float(args.k):.8g}"
+risk_out_path = f"dynamic_tabpfn_discrete_risk_{k_token}{binning_suffix}.csv"
 
 print(f"Total datasets: {len(dataset_files)}")
 print(f"Datasets to process: {dataset_files if dataset_files else 'None'}")
-print(f"Using k={args.k} for landmark quantiles")
+print(f"Using k={args.k} with binning={args.binning} for landmark generation")
 
 # =============================================================================
 # Hyperparameter Configuration
@@ -81,6 +87,64 @@ hyperparameters = [
 # =============================================================================
 # Helper Functions
 # =============================================================================
+def k_to_percentile_grid(k: float, tol: float = 1e-6):
+    """Return (percentiles, n_bins, K_int_or_None) for a step size k."""
+    kf = float(k)
+    if not (0.0 < kf < 100.0):
+        raise ValueError(f"k must be in (0, 100), got {k}")
+
+    K = 100.0 / kf
+    K_int = int(round(K))
+    if np.isclose(K, K_int, rtol=0.0, atol=tol) and K_int >= 2:
+        percentiles = (np.arange(1, K_int) * (100.0 / K_int))
+        return percentiles, (K_int - 1), K_int
+
+    percentiles = np.arange(kf, 100.0, kf)
+    return percentiles, int(len(percentiles)), None
+
+
+def build_landmarks_from_train(train_df, time_col_for_tau, k, binning):
+    """Build landmark times from train data using quantile or KM-quantile bins."""
+    if binning == "pooled":  # POOLED (11-06): pooled measurement and event times, km_landmarks.pooled_taus
+        from km_landmarks import pooled_taus
+        return pooled_taus(train_df, time_col_for_tau, k)
+    patient_outcome = (
+        train_df.sort_values(time_col_for_tau)
+        .groupby("pid")
+        .agg(
+            t_event=(time_col_for_tau, "max"),
+            status_event=("event", "max"),
+        )
+    )
+
+    event_times = patient_outcome.loc[patient_outcome["status_event"] == 1, "t_event"].to_numpy(dtype=float)
+    if len(event_times) == 0:
+        return np.array([], dtype=float)
+
+    percentiles, n_bins, _ = k_to_percentile_grid(k)
+
+    if binning == "quantile":
+        taus = np.percentile(event_times, percentiles)
+    else:
+        km_time, km_surv = kaplan_meier_estimator(
+            patient_outcome["status_event"].astype(bool).to_numpy(),
+            patient_outcome["t_event"].to_numpy(dtype=float),
+        )
+        if len(km_time) == 0:
+            taus = np.percentile(event_times, percentiles)
+        else:
+            km_range = (float(km_surv[0]), float(km_surv[-1]))
+            surv_levels = np.linspace(km_range[0], km_range[1], n_bins + 2)[1:-1]
+            taus = []
+            for s in surv_levels:
+                idx = np.searchsorted(-km_surv, -s)
+                if idx < len(km_time):
+                    taus.append(float(km_time[idx]))
+            taus = np.array(taus) if taus else np.percentile(event_times, percentiles)
+
+    return np.unique(np.asarray(taus, dtype=float))
+
+
 def get_locf_covariates(df, pid, tau, feature_cols, default_values, return_time_since=False):
     """
     Get Last Observation Carried Forward (LOCF) covariates for a patient at time tau.
@@ -150,6 +214,50 @@ def hazards_to_survival_df(pids, eval_times, hazard_probs):
     )
     return tmp
 
+
+def dh_oof_rows(train_processed, taus, feature_cols, default_values, quantile_info, time_since, time_col, fit_fn, predict_fn,
+                dataset_name, hyperparameter, n_folds):
+    """DOOF (11-03): out-of-fold survival predictions of the TRAINING patients, for post-hoc calibration
+    (../tmlr_ipcw_loss_10_25/calibrate_dynamic.py). Training patients split into n_folds folds (KFold by patient, seed 42,
+    as dynamic_cf_w.py); each fold predicted by the model fitted on the hazard rows of the other folds (same row
+    construction and the same features as the real fit), at every landmark, for the patients at risk at tau."""
+    from sklearn.model_selection import KFold
+    pids = np.unique(train_processed["pid"])
+    t_event = train_processed.groupby("pid")[time_col].max()
+    rows = []
+    for i_fit, i_pred in KFold(n_folds, shuffle=True, random_state=42).split(pids):
+        fit_df = train_processed[train_processed["pid"].isin(pids[i_fit])]
+        pred_df = train_processed[train_processed["pid"].isin(pids[i_pred])]
+        Xs, ys = [], []
+        for ti in range(len(taus) - 1):
+            X, y = construct_binary_trainset_for_landmark(fit_df, taus[ti], taus[ti:], feature_cols, default_values, taus,
+                                                          quantile_info, time_since, time_col)
+            if len(X) == 0:
+                continue
+            X = X.copy()
+            X["tau"] = float(taus[ti])
+            Xs.append(X)
+            ys.append(y)
+        if not Xs:
+            continue
+        model = fit_fn(pd.concat(Xs, axis=0, ignore_index=True), pd.concat(ys, axis=0, ignore_index=True))
+        for ti in range(len(taus) - 1):
+            tau = float(taus[ti])
+            sub = pred_df[pred_df["pid"].isin(t_event.index[t_event > tau])]
+            X, ppids, times = construct_binary_testset_for_landmark(sub, taus[ti], taus[ti:], feature_cols, default_values, taus,
+                                                                    quantile_info, time_since, time_col)
+            if len(X) == 0:
+                continue
+            X = X.copy()
+            X["tau"] = tau
+            tmp = hazards_to_survival_df(ppids, times, predict_fn(model, X))
+            for p, t, sv in zip(tmp["pid"].to_numpy(), tmp["t"].to_numpy(), tmp["surv_prob"].to_numpy()):
+                if not np.isclose(float(t), tau):
+                    rows.append({"pid": int(p), "tau": tau, "t": float(t), "risk": np.nan, "surv_prob": float(sv),
+                                 "dataset": dataset_name, "hyperparameter": str(hyperparameter), "eval_set": "oof", "k": args.k})
+    print(f"  [DOOF] {len(rows)} out-of-fold survival predictions of {len(pids)} training patients")
+    return rows
+
 def construct_binary_trainset_for_landmark(df, tau, future_times, feature_cols, default_values, taus, quantile_info, time_since, followup_col="time2"):
     """
     Construct binary training dataset for a specific landmark tau.
@@ -180,7 +288,7 @@ def construct_binary_trainset_for_landmark(df, tau, future_times, feature_cols, 
           .groupby("pid")
           .agg(
               t_event=(followup_col, "max"),
-              status_event=("event", "last"),
+              status_event=("event", "max"),
           )
     )
 
@@ -291,7 +399,7 @@ def construct_binary_testset_for_landmark(df, tau, future_times, feature_cols, d
           .groupby("pid")
           .agg(
               t_event=(followup_col, "max"),
-              status_event=("event", "last"),
+              status_event=("event", "max"),
           )
     )
     
@@ -355,6 +463,7 @@ def construct_binary_testset_for_landmark(df, tau, future_times, feature_cols, d
 # Global accumulators for CSV output
 # ============================================================
 all_risk_rows = []
+all_oof_rows = []  # DOOF
 
 
 # ============================================================
@@ -406,19 +515,25 @@ for hyperparameter in hyperparameters:
         test_df = original_df[original_df["pid"].isin(pid_test)].copy()
 
         # --- Define landmarks using TRAIN ONLY ---
-        event_times = train_df.loc[train_df["event"] == 1, time_col_for_tau].values
-        if len(event_times) == 0:
+        taus = build_landmarks_from_train(
+            train_df=train_df,
+            time_col_for_tau=time_col_for_tau,
+            k=args.k,
+            binning=args.binning,
+        )
+
+        if len(taus) == 0:
             print(f"Skipping {dataset_name}: No events observed in TRAIN split")
             continue
 
-        percentiles = np.arange(args.k, 100, args.k)
-        percentiles = [p for p in percentiles if round(p, 2) < 100]
-
-        taus = np.percentile(event_times, percentiles)
         num_eval_times = len(taus)
 
+        if num_eval_times < 2:
+            print(f"Skipping {dataset_name}: Need at least 2 landmark times, got {num_eval_times}")
+            continue
+
         print(f"Landmarks (taus) from TRAIN: {[f'{t:.6g}' for t in taus]}")
-        print(f"Number of evaluation times: {num_eval_times} (k={args.k})")
+        print(f"Number of evaluation times: {num_eval_times} (k={args.k}, binning={args.binning})")
 
         # -----------------------------
         # One-hot encode categorical (fac_) and align train/val/test columns
@@ -546,6 +661,19 @@ for hyperparameter in hyperparameters:
 
         tabpfn_model = TabPFNClassifier(random_state=SEED)
         tabpfn_model.fit(X_train_array, y_train_array)
+        if args.oof_folds:  # DOOF
+            def _fit(X, y):
+                if len(X) > 50000:
+                    idx = np.random.choice(len(X), size=50000, replace=False)
+                    X, y = X.iloc[idx].reset_index(drop=True), y.iloc[idx].reset_index(drop=True)
+                m = TabPFNClassifier(random_state=SEED)
+                m.fit(X.to_numpy(dtype=float), y.to_numpy(dtype=int))
+                return m
+            def _pred(m, X):
+                p = m.predict_proba(X.to_numpy(dtype=float))
+                return p[:, 1] if p.shape[1] > 1 else p[:, 0]
+            all_oof_rows += dh_oof_rows(train_processed, taus, feature_cols_processed, default_values, quantile_info, time_since,
+                                        time_col_for_tau, _fit, _pred, dataset_name, hyperparameter, args.oof_folds)
 
         # -----------------------------
         # For each landmark tau (excluding last tau), run inference using the same model
@@ -566,7 +694,7 @@ for hyperparameter in hyperparameters:
                   .groupby("pid")
                   .agg(
                       t_event=(time_col_for_tau, "max"),
-                      status_event=("event", "last"),
+                      status_event=("event", "max"),
                   )
             )
             val_at_risk_pids = val_patient_outcome.index[
@@ -579,7 +707,7 @@ for hyperparameter in hyperparameters:
                   .groupby("pid")
                   .agg(
                       t_event=(time_col_for_tau, "max"),
-                      status_event=("event", "last"),
+                      status_event=("event", "max"),
                   )
             )
             test_at_risk_pids = test_patient_outcome.index[
@@ -722,5 +850,10 @@ if len(all_risk_rows) > 0:
     print(f"  Test rows: {test_rows} ({(~results_df[results_df['eval_set']=='test']['risk'].isna()).sum()} risk scores, {(~results_df[results_df['eval_set']=='test']['surv_prob'].isna()).sum()} surv probs)")
 else:
     print("No results to save")
+
+if all_oof_rows:  # DOOF
+    oof_path = risk_out_path.replace("_risk_", "_oof_")
+    pd.DataFrame(all_oof_rows).to_csv(oof_path, index=False)
+    print(f"Out-of-fold predictions saved to: {oof_path}")
 
 print("\nProcessing complete!")

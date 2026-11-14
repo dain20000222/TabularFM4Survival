@@ -1,8 +1,65 @@
+# REPORT copy (2026-10-18) of ../tmlr_dyn_metrics_fix_10_18/metrics.py (NANFIX); also scores the cf_* files.
+# (copy of tmlr_datamean_rerun_10_11/tcsa/metrics.py; the allowlist also accepts the IPCW XGBoost runs, marked IPCW)
+# NANFIX (2026-10-18): metrics that cannot be computed (evaluation time outside the test follow-up,
+# no valid AUC) are NaN instead of 0, so they are left out of the averages (metrics_val.py drops NaN).
+# Changes marked NANFIX; everything else unchanged.
 import pandas as pd
 import numpy as np
+if not hasattr(np, "infty"):
+    np.infty = np.inf
+import os
 import re
 from sksurv.metrics import concordance_index_censored, concordance_index_ipcw, cumulative_dynamic_auc, brier_score
 from sksurv.util import Surv
+
+# PKGAGG (2026-10-26): DYN_AGG=sksurv aggregates the horizons of a landmark with the package
+# formulas (integrated AUC = cumulative_dynamic_auc's mean_auc, KM-weighted; IBS = trapezoid over the
+# horizons with test data / (last - first horizon), as integrated_brier_score). DYN_AGG=custom (default)
+# keeps the submission's aggregation (model-predicted survival weights; trapezoid / t_{K-1}).
+# check_aggregation.py shows the two differ only in these choices.
+DYN_AGG = os.environ.get("DYN_AGG", "custom")
+assert DYN_AGG in ("custom", "sksurv"), DYN_AGG
+_trapz = getattr(np, "trapezoid", None) or np.trapz
+
+
+def compute_package_aggregates(survival_train, survival_test, pred_df, landmark_times, auc_dict, bs_dict):
+    """PKGAGG: integrated AUC(tau) and IBS(tau) with the scikit-survival formulas, per landmark, on the
+    horizons whose per-horizon value exists (not NaN in auc_dict / bs_dict: horizons with test data)."""
+    iauc, ibs = {}, {}
+    for tau in landmark_times[:-1]:
+        hor = [t for t in landmark_times if t > tau]
+        at = pred_df[(pred_df['tau'] == tau) & pred_df['t'].isna()].merge(survival_test, on='pid', how='inner')
+        tr = survival_train[survival_train['time'] > tau]
+        # 11-04: same names as in compute_ipcw_auc, so that eval_dynamic_w.py's replacement metrics (which read the
+        # landmark's patients from the caller's `merged` / `survival_train_tau`) use THIS landmark's patients here too;
+        # without them the covariate-dependent iAUC used the patients of another landmark. No effect on sksurv.
+        merged, survival_train_tau = at, tr  # noqa: F841
+        if len(at) == 0 or len(tr) == 0:
+            iauc[tau], ibs[tau] = np.nan, np.nan
+            continue
+        ytr = Surv.from_arrays(tr['event'].astype(bool), tr['time'])
+        yte = Surv.from_arrays(at['event'].astype(bool), at['time'])
+        ha = [t for t in hor if not np.isnan(auc_dict.get((tau, t), np.nan))]
+        hb = [t for t in hor if not np.isnan(bs_dict.get((tau, t), np.nan))]
+        if len(ha) == 0:
+            iauc[tau] = np.nan
+        elif len(ha) == 1:
+            iauc[tau] = float(auc_dict[(tau, ha[0])])
+        else:
+            try:
+                iauc[tau] = float(cumulative_dynamic_auc(ytr, yte, at['risk'].values, times=ha)[1])
+            except Exception as e:
+                print(f"  PKGAGG: mean AUC failed at tau={tau}: {e}")
+                iauc[tau] = np.nan
+        if len(hb) == 0:
+            ibs[tau] = np.nan
+        elif len(hb) == 1:
+            ibs[tau] = float(bs_dict[(tau, hb[0])])
+        else:
+            bs = np.array([bs_dict[(tau, t)] for t in hb])  # the same brier_score calls as the custom path
+            ibs[tau] = float(_trapz(bs, hb) / (hb[-1] - hb[0]))
+        print(f"  PKGAGG tau={tau}: integrated AUC={iauc[tau]:.4f}, IBS={ibs[tau]:.4f} ({len(ha)}/{len(hb)} horizons)")
+    return iauc, ibs
 
 
 def load_survival_dataset(path):
@@ -253,9 +310,9 @@ def compute_ipcw_auc(survival_train, survival_test, pred_df, landmark_times):
         except Exception as e:
             msg = str(e)
             if "all times must be within follow-up time of test data" in msg:
-                print(f"  IPCW AUC: times out of test follow-up for tau={tau}; setting AUC=0 for all future times")
+                print(f"  IPCW AUC: times out of test follow-up for tau={tau}; setting AUC=NaN for all future times")  # NANFIX
                 for t in future_times:
-                    results[(tau, t)] = 0.0
+                    results[(tau, t)] = np.nan  # NANFIX (was 0.0)
             else:
                 print(f"  Error calculating IPCW AUC for tau={tau}: {msg}")
                 for t in future_times:
@@ -363,8 +420,8 @@ def compute_brier_score(survival_train, survival_test, pred_df, landmark_times):
             except Exception as e:
                 msg = str(e)
                 if "all times must be within follow-up time of test data" in msg:
-                    print(f"  Brier Score: t={t} out of test follow-up for tau={tau}; setting BS=0")
-                    results[(tau, t)] = 0.0
+                    print(f"  Brier Score: t={t} out of test follow-up for tau={tau}; setting BS=NaN")  # NANFIX
+                    results[(tau, t)] = np.nan  # NANFIX (was 0.0)
                 else:
                     print(f"  Error calculating Brier Score for tau={tau}, t={t}: {msg}")
                     results[(tau, t)] = np.nan
@@ -406,7 +463,7 @@ def compute_weighted_average_auc(pred_df, auc_ipcw_dict, landmark_times):
         if len(future_times) == 1:
             t_only = future_times[0]
             auc = auc_ipcw_dict.get((tau_k, t_only), 0.0)
-            results[tau_k] = 0.0 if auc is None or np.isnan(auc) else float(auc)
+            results[tau_k] = np.nan if auc is None or np.isnan(auc) else float(auc)  # NANFIX (was 0.0)
             continue
 
         # For this tau_k, get all patients' survival probabilities at different times
@@ -469,8 +526,8 @@ def compute_weighted_average_auc(pred_df, auc_ipcw_dict, landmark_times):
                 results[tau_k] = np.mean(aucs)
                 print(f"  Mean AUC(tau={tau_k}): {results[tau_k]:.4f}")
             else:
-                results[tau_k] = 0
-                print(f"  Mean AUC(tau={tau_k}): 0 (no valid AUCs)")
+                results[tau_k] = np.nan  # NANFIX (was 0)
+                print(f"  Mean AUC(tau={tau_k}): NaN (no valid AUCs)")
     return results
 
 
@@ -557,12 +614,21 @@ def main():
         'joint_model',
         'landmark_cox',
         'landmark_rsf',
+        'dynamic_tcsa',
+        'dynamic_mitra_landmark',  # landmarked MITRA-CF (../../tmlr_landmark_mitra_10_17)
+        'dynamic_mitra_discrete_cal', 'dynamic_tabpfn_discrete_cal',  # calibrated DH models (11-03)
+        'dynamic_xgboost_discrete_cal',  # calibrated XGBoost-DH (11-06; was missing, so its files were skipped)
+        'landmark_linear_mtlr', 'landmark_neural_mtlr', 'landmark_bce_surv',  # MTLR / BCESurv landmark baselines (11-03)
     }
 
     # Keep only files whose model prefix (before "_risk_") is in the hardcoded list
+    # IPCW: also the IPCW-weighted XGBoost-CF runs (dynamic_xgboost_ipcw_{censoring}_f{floor})
     all_model_files = [
         f for f in all_model_files
         if f.replace('.csv', '').split('_risk_')[0] in allowed_models
+        or f.startswith('cf_')  # REPORT: the MITRA-CF configurations of ../tmlr_dynamic_report_10_18
+        or f.startswith('mc_')  # MC (11-07): multi-class formulation (dynamic_cf_w.py --formulation mc) and its calibrated files
+        or re.fullmatch(r"dynamic_xgboost_ipcw_(auto|km|cox|rsf)_f[0-9.]+", f.replace('.csv', '').split('_risk_')[0])
     ]
 
     # List to store rows for CSV output
@@ -593,6 +659,7 @@ def main():
 
         # Load predictions
         pred_df = pd.read_csv(model_file)
+        pred_df['dataset'] = pred_df['dataset'].astype(str).str.replace(r'\.csv$', '', regex=True)  # the joint model (R) writes 'aids.csv'
         
         # Get unique combinations of dataset and hyperparameter (not eval_set)
         if 'hyperparameter' in pred_df.columns:
@@ -623,7 +690,7 @@ def main():
                 continue
             
             # Load ground truth survival data for this dataset (if exists in a data folder)
-            survival_path = f'data/{dataset_name}.csv'
+            survival_path = f'data_mean/{dataset_name}.csv'  # outcomes are identical in data/ and data_mean/
             print(f"Loading ground truth from {survival_path}")
             try:
                 survival_all = load_survival_dataset(survival_path)
@@ -693,11 +760,15 @@ def main():
                 
                 # Calculate Weighted Average AUC
                 print(f"\n  Calculating Weighted Average AUC for {eval_set}...")
-                weighted_avg_auc = compute_weighted_average_auc(dataset_pred_df, auc_ipcw, landmark_times)
+                if DYN_AGG == "sksurv":  # PKGAGG
+                    weighted_avg_auc, integrated_brier_pkg = compute_package_aggregates(
+                        survival_train, survival_eval_filtered, dataset_pred_df, landmark_times, auc_ipcw, brier_scores)
+                else:
+                    weighted_avg_auc = compute_weighted_average_auc(dataset_pred_df, auc_ipcw, landmark_times)
                 
                 # Calculate Integrated Brier Score
                 print(f"\n  Calculating Integrated Brier Score for {eval_set}...")
-                integrated_brier = compute_integrated_brier_score(brier_scores, landmark_times)
+                integrated_brier = integrated_brier_pkg if DYN_AGG == "sksurv" else compute_integrated_brier_score(brier_scores, landmark_times)  # PKGAGG
                 
                 # Store results with eval_set suffix
                 results_dict = {

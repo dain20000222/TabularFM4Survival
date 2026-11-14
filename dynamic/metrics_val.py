@@ -1,3 +1,7 @@
+# REPORT copy (2026-10-18) of ../tmlr_dyn_metrics_fix_10_18/metrics_val.py (NANFIX), unchanged.
+# (copy of tmlr_datamean_rerun_10_11/tcsa/metrics_val.py; output metrics_val.csv)
+# NANFIX (2026-10-18): the *_all lists keep NaN entries (landmarks whose metric could not be computed);
+# the averages and the hyperparameter selection drop them, as before.
 import pandas as pd
 import numpy as np
 
@@ -125,7 +129,7 @@ def select_best_hyperparameters(metrics_csv='metrics.csv', val_metric='cindex_ip
                 # Compute average test score across all (tau, t) combinations
                 test_scores[f'avg_{metric}'] = test_vals.mean() if len(test_vals) > 0 else np.nan
                 # Store all test scores as a list
-                test_scores[f'{metric}_all'] = test_vals.tolist() if len(test_vals) > 0 else []
+                test_scores[f'{metric}_all'] = test_data['test_score'].tolist()  # NANFIX: keep NaN so that the list stays aligned with the landmarks
             else:
                 test_scores[f'avg_{metric}'] = np.nan
                 test_scores[f'{metric}_all'] = []
@@ -210,7 +214,7 @@ def main():
             combined_df = combined_df[cols]
         
         # Save to single file
-        output_file = 'metrics_val.csv'
+        output_file = 'metrics_val.csv'  # IPCW (was metrics_val_tcsa.csv)
         combined_df.to_csv(output_file, index=False)
         
         print("\n" + "="*70)

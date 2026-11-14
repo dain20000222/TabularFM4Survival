@@ -19,6 +19,7 @@ from ddh.ddh_api import DynamicDeepHit
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import ParameterGrid
 import torch
+from sksurv.nonparametric import kaplan_meier_estimator
 warnings.filterwarnings("ignore")
 
 # =============================================================================
@@ -30,8 +31,10 @@ warnings.filterwarnings("ignore")
 # =============================================================================
 
 # Parse command line arguments
-parser = argparse.ArgumentParser(description='Run dynamic DeepHit with different k values for landmark quantiles')
+parser = argparse.ArgumentParser(description='Run dynamic DeepHit with different landmark binning strategies')
 parser.add_argument('--k', type=float, default=20, help='Step size for landmark time percentiles (default: 20)')
+parser.add_argument('--binning', type=str, default='km_quantile', choices=['quantile', 'km_quantile', 'pooled'],
+                    help='Landmark binning strategy: quantile or km_quantile (default: km_quantile)')
 args = parser.parse_args()
 
 # =============================================================================
@@ -57,11 +60,13 @@ data_dir = os.path.join("data_mean")
 dataset_files = [f for f in os.listdir(data_dir) if f.endswith(".csv")]
 
 # Output file path for survival probability results
-surv_probs_out_path = f"dynamic_deephit_risk_{args.k}.csv"
+binning_suffix = f"_{args.binning}" if args.binning != "quantile" else ""
+k_token = f"{float(args.k):.8g}"
+surv_probs_out_path = f"dynamic_deephit_risk_{k_token}{binning_suffix}.csv"
 
 print(f"Total datasets: {len(dataset_files)}")
 print(f"Datasets to process: {dataset_files if dataset_files else 'None'}")
-print(f"Using k={args.k} for landmark quantiles")
+print(f"Using k={args.k} with binning={args.binning} for landmark generation")
 
 # =============================================================================
 # Global Data Accumulators
@@ -73,6 +78,64 @@ all_surv_rows = []
 # =============================================================================
 # Helper Functions
 # =============================================================================
+def k_to_percentile_grid(k: float, tol: float = 1e-6):
+    """Return (percentiles, n_bins, K_int_or_None) for a step size k."""
+    kf = float(k)
+    if not (0.0 < kf < 100.0):
+        raise ValueError(f"k must be in (0, 100), got {k}")
+
+    K = 100.0 / kf
+    K_int = int(round(K))
+    if np.isclose(K, K_int, rtol=0.0, atol=tol) and K_int >= 2:
+        percentiles = (np.arange(1, K_int) * (100.0 / K_int))
+        return percentiles, (K_int - 1), K_int
+
+    percentiles = np.arange(kf, 100.0, kf)
+    return percentiles, int(len(percentiles)), None
+
+
+def build_landmarks_from_train(train_df, time_col_for_tau, k, binning):
+    """Build landmark times from train data using quantile or KM-quantile bins."""
+    if binning == "pooled":  # POOLED (11-06): pooled measurement and event times, km_landmarks.pooled_taus
+        from km_landmarks import pooled_taus
+        return pooled_taus(train_df, time_col_for_tau, k)
+    patient_outcome = (
+        train_df.sort_values(time_col_for_tau)
+        .groupby("pid")
+        .agg(
+            t_event=(time_col_for_tau, "max"),
+            status_event=("event", "max"),
+        )
+    )
+
+    event_times = patient_outcome.loc[patient_outcome["status_event"] == 1, "t_event"].to_numpy(dtype=float)
+    if len(event_times) == 0:
+        return np.array([], dtype=float)
+
+    percentiles, n_bins, _ = k_to_percentile_grid(k)
+
+    if binning == "quantile":
+        taus = np.percentile(event_times, percentiles)
+    else:
+        km_time, km_surv = kaplan_meier_estimator(
+            patient_outcome["status_event"].astype(bool).to_numpy(),
+            patient_outcome["t_event"].to_numpy(dtype=float),
+        )
+        if len(km_time) == 0:
+            taus = np.percentile(event_times, percentiles)
+        else:
+            km_range = (float(km_surv[0]), float(km_surv[-1]))
+            surv_levels = np.linspace(km_range[0], km_range[1], n_bins + 2)[1:-1]
+            taus = []
+            for s in surv_levels:
+                idx = np.searchsorted(-km_surv, -s)
+                if idx < len(km_time):
+                    taus.append(float(km_time[idx]))
+            taus = np.array(taus) if taus else np.percentile(event_times, percentiles)
+
+    return np.unique(np.asarray(taus, dtype=float))
+
+
 def convert_to_sequential_format(df, covariates):
     """
     Convert longitudinal data to sequential format for Dynamic DeepHit.
@@ -135,8 +198,14 @@ def convert_to_sequential_format(df, covariates):
 
     # Return as object arrays to handle variable-length sequences
     # Note: Dynamic DeepHit's _get_padded_features will handle conversion to proper numeric arrays
-    return (np.array(x_data, dtype=object), np.array(t_data, dtype=object), 
-            np.array(e_data, dtype=object), np.array(pid_data))
+    # 11-07: build 1-d object arrays explicitly. np.array(list, dtype=object) turns sequences of EQUAL length into a 3-d
+    # array (FRTCS: 3 rows for every patient), which broke the padding ("can't convert np.ndarray of type numpy.object_").
+    # For variable lengths (the paper's datasets) the result is unchanged.
+    def _seq(a):
+        out = np.empty(len(a), dtype=object)
+        out[:] = a
+        return out
+    return (_seq(x_data), _seq(t_data), _seq(e_data), np.array(pid_data))
 
 # =============================================================================
 # Main Dataset Processing Loop
@@ -200,29 +269,30 @@ for i, file_name in enumerate(dataset_files, start=1):
     # Landmark Time Point Selection (Training Set Only)
     # =================================================================
     
-    # Extract event times from training set only to avoid data leakage
-    event_times = df_train[df_train[event_col] == 1]["time2"].values
-    if len(event_times) == 0:
+    # Build landmarks from training set only to avoid data leakage
+    taus = build_landmarks_from_train(
+        train_df=df_train,
+        time_col_for_tau=time2_col,
+        k=args.k,
+        binning=args.binning,
+    )
+
+    if len(taus) == 0:
         print(f"Skipping {dataset_name}: No events observed in TRAIN split")
         continue
 
-    # Generate landmark time points using k-step percentiles
-    percentiles = np.arange(args.k, 100, args.k)
-
-    # Remove percentiles that round to 100% (floating-point precision issue)
-    percentiles = [p for p in percentiles if round(p, 2) < 100]
-
-    # Calculate actual landmark times from training event times
-    times = np.percentile(event_times, percentiles)
-
-    taus = list(times)
+    taus = list(taus)
     num_eval_times = len(taus)
+
+    if num_eval_times < 2:
+        print(f"Skipping {dataset_name}: Need at least 2 landmark times, got {num_eval_times}")
+        continue
 
     t_max = float(df["time2"].max())
     eval_times = list(taus) + [t_max]
 
     print(f"Landmarks (taus) from TRAIN: {[f'{t:.6g}' for t in taus]}")
-    print(f"Number of evaluation times: {num_eval_times} (k={args.k})")
+    print(f"Number of evaluation times: {num_eval_times} (k={args.k}, binning={args.binning})")
 
     # =================================================================
     # Feature Engineering and Preprocessing
@@ -370,7 +440,7 @@ for i, file_name in enumerate(dataset_files, start=1):
                .groupby("pid")
                .agg(
                    t_event=("time2", "max"),
-                   status_event=("event", "last")
+                   status_event=("event", "max")
                )
     )
     patient_outcome_test = (
@@ -378,7 +448,7 @@ for i, file_name in enumerate(dataset_files, start=1):
                .groupby("pid")
                .agg(
                    t_event=("time2", "max"),
-                   status_event=("event", "last")
+                   status_event=("event", "max")
                )
     )
 

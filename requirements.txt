@@ -1,31 +1,34 @@
 # Python dependencies for the static and dynamic survival experiments.
-# Tested with Python 3.9. Install with:  pip install -r requirements.txt
+# The experiments of the paper were run with the versions below. MITRA and TabPFN-2.5 were run in separate
+# environments from the remaining models (see README.md, "Installation").
 #
-# Core scientific stack
-numpy==2.0.2
-pandas==2.3.2
-scipy==1.13.1
-matplotlib==3.9.4
+# Common to all environments
+numpy==1.26.4                  # scikit-survival 0.21 needs NumPy 1.x
+pandas
+scipy
+scikit-learn
 
-# Machine learning / survival analysis
-scikit-learn==1.5.2
-scikit-survival==0.23.1        # imported as `sksurv`
-xgboost==2.1.4
-torch==2.7.0
-pycox==0.3.0                   # dynamic / discrete-time neural baselines
-torchtuples==0.2.2             # pycox dependency
+# Survival baselines, XGBoost models, calibration, evaluation, analysis
+scikit-survival==0.21.0        # imported as `sksurv`
+xgboost==3.0.5                 # XGBoost results differ slightly between xgboost versions (2.1, 3.0, 3.1+)
+lifelines
+torch
+pycox==0.3.0                   # MTLR, Neural MTLR, MLP BCESurv, DeepHit, DeepSurv
+torchtuples                    # pycox dependency
+matplotlib
+seaborn
 
-# Tabular foundation models
-tabpfn==2.1.0
-autogluon.tabular>=1.2         # provides the MITRA tabular foundation model
-                               # (install the full `autogluon` if preferred)
+# Tabular foundation models (one environment each)
+tabpfn==6.0.6                  # TabPFN-2.5
+autogluon.tabular==1.4.0       # provides the MITRA tabular foundation model
 
-# Utilities
-elote>=1.1.0                   # ELO rating aggregation in the analysis scripts
+# TCSA (dynamic/dynamic_tcsa.py, with the bundled dynamic/tdsurv/)
+jax
+jaxlib
 
 # ---------------------------------------------------------------------------
-# NOT on PyPI / installed separately:
-#   * ddh/    -- Dynamic-DeepHit implementation, bundled locally under dynamic/ddh
-#   * R + the `JM` package    -- required only for dynamic/dynamic_jm.R
-#     install.packages("JM")   (also needs `survival`, `nlme`)
+# Not on PyPI / installed separately:
+#   * dynamic/ddh/     Dynamic-DeepHit implementation, bundled
+#   * dynamic/tdsurv/  reference implementation of TCSA (https://github.com/spotify-research/tdsurv, Apache-2.0), bundled
+#   * R with the packages JMbayes2, survival, nlme, dplyr, readr: only for dynamic/dynamic_jm.R (Joint Model)
 # ---------------------------------------------------------------------------

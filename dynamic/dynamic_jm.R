@@ -30,6 +30,42 @@ dataset_files <- list.files(data_dir, pattern = "\\.csv$", full.names = TRUE)
 
 # Landmark time step parameter (from command line or default)
 k <- 20.0
+binning <- "km_quantile"
+
+# Parse command-line arguments: --k=<float> --binning=<quantile|km_quantile>
+cli_args <- commandArgs(trailingOnly = TRUE)
+if (length(cli_args) > 0) {
+  i <- 1
+  while (i <= length(cli_args)) {
+    arg <- cli_args[[i]]
+
+    if (startsWith(arg, "--k=")) {
+      k_val <- suppressWarnings(as.numeric(sub("^--k=", "", arg)))
+      if (!is.na(k_val)) k <- k_val
+    } else if (arg == "--k" && i < length(cli_args)) {
+      k_val <- suppressWarnings(as.numeric(cli_args[[i + 1]]))
+      if (!is.na(k_val)) {
+        k <- k_val
+        i <- i + 1
+      }
+    } else if (startsWith(arg, "--binning=")) {
+      binning <- sub("^--binning=", "", arg)
+    } else if (arg == "--binning" && i < length(cli_args)) {
+      binning <- cli_args[[i + 1]]
+      i <- i + 1
+    }
+
+    i <- i + 1
+  }
+}
+
+if (!(binning %in% c("quantile", "km_quantile", "pooled"))) {  # POOLED (11-06)
+  stop("Invalid --binning value. Use one of: quantile, km_quantile, pooled")
+}
+
+if (!is.finite(k) || k <= 0 || k >= 100) {
+  stop("k must be in (0, 100)")
+}
 
 # Format k parameter for consistent file naming
 if (k %% 1 == 0) {
@@ -37,7 +73,10 @@ if (k %% 1 == 0) {
 } else {
   k_str <- format(k, scientific = FALSE, trim = TRUE)
 }
-out_path <- paste0("joint_model_risk_", k_str, ".csv")
+binning_suffix <- if (binning == "quantile") "" else paste0("_", binning)
+out_path <- paste0("joint_model_risk_", k_str, binning_suffix, ".csv")
+
+cat("Using k=", k, " with binning=", binning, " for landmark generation\n", sep = "")
 
 # =============================================================================
 # Hyperparameter Configuration
@@ -68,7 +107,10 @@ biomarker_map <- list(
   "csl.csv"       = c("num_prot", "num_prot_prev", "num_prot_mean", "num_prot_prev_mean"),  # Protein markers  
   "epileptic.csv" = c("num_dose", "num_dose_mean"),                               # Medication dose
   "heart.csv"     = c("fac_transplant", "fac_transplant_mode"),                   # Transplant status
-  "oldmort.csv"   = c("fac_civ")                                                  # Civilian status
+  "oldmort.csv"   = c("fac_civ"),                                                 # Civilian status
+  # 11-06: datasets added in ../tmlr_dyn_new_datasets_11_06 (one longitudinal marker + its running mean, as aids / epileptic)
+  "FRTCS.csv"      = c("num_sbp", "num_sbp_mean"),                                # Systolic blood pressure
+  "heartvalve.csv" = c("num_lvmi", "num_lvmi_mean")                               # Left ventricular mass index (num_grad: 36% missing)
 )
 
 #' Get Hardcoded Biomarkers for Dataset
@@ -189,22 +231,110 @@ pick_cox_covariates <- function(df, marker_cols, bm_raw = NULL, dataset_name = N
   covs
 }
 
-# Robust tau construction for any k + drop percentiles rounding to 100.00
-safe_unique_taus <- function(event_times, k_step) {
+# Robust percentile grid for any k.
+k_to_percentile_grid <- function(k_step, tol = 1e-6) {
+  if (!is.finite(k_step) || k_step <= 0 || k_step >= 100) {
+    stop("k_step must be in (0, 100)")
+  }
+
+  K <- 100 / k_step
+  K_int <- round(K)
+
+  if (abs(K - K_int) <= tol && K_int >= 2) {
+    percentiles <- (seq_len(K_int - 1) * (100 / K_int))
+    return(list(percentiles = percentiles, n_bins = K_int - 1, K_int = K_int))
+  }
+
+  # same as np.arange(k, 100, k) in the Python scripts (km_landmarks.py): for k = 16.66666 the last percentile is
+  # 99.99996, so n_bins = 6 as in every other model (the earlier "to = 100 - k_step" gave 5 and one landmark fewer)
+  percentiles <- seq(from = k_step, to = 100, by = k_step)
+  percentiles <- percentiles[percentiles > 0 & percentiles < 100]
+  list(percentiles = percentiles, n_bins = length(percentiles), K_int = NA_integer_)
+}
+
+# Robust tau construction using quantile or KM-quantile binning.
+safe_unique_taus <- function(times_all, events_all, k_step, binning = "km_quantile") {
+  if (length(times_all) == 0 || length(events_all) == 0) return(numeric(0))
+  if (length(times_all) != length(events_all)) return(numeric(0))
+
+  times_all <- as.numeric(times_all)
+  events_all <- as.integer(events_all)
+
+  valid <- is.finite(times_all) & !is.na(events_all)
+  times_all <- times_all[valid]
+  events_all <- events_all[valid]
+
+  event_times <- times_all[events_all == 1]
   if (length(event_times) == 0) return(numeric(0))
 
-  percentiles <- seq(from = k_step, to = 100 - k_step, by = k_step)
-  percentiles <- percentiles[round(percentiles, 2) < 100]
-  percentiles <- percentiles[percentiles > 0 & percentiles < 100]
-  if (length(percentiles) == 0) return(numeric(0))
+  grid <- k_to_percentile_grid(k_step)
+  percentiles <- grid$percentiles
+  n_bins <- grid$n_bins
+  if (length(percentiles) == 0 || n_bins <= 0) return(numeric(0))
 
-  taus <- as.numeric(stats::quantile(
-    event_times,
-    probs = percentiles / 100,
-    names = FALSE,
-    na.rm = TRUE,
-    type = 7
-  ))
+  if (binning == "quantile") {
+    taus <- as.numeric(stats::quantile(
+      event_times,
+      probs = percentiles / 100,
+      names = FALSE,
+      na.rm = TRUE,
+      type = 7
+    ))
+    return(sort(unique(taus)))
+  }
+
+  sf <- tryCatch(
+    survival::survfit(survival::Surv(times_all, events_all) ~ 1),
+    error = function(e) NULL
+  )
+
+  if (is.null(sf) || length(sf$time) == 0 || length(sf$surv) == 0) {
+    taus <- as.numeric(stats::quantile(
+      event_times,
+      probs = percentiles / 100,
+      names = FALSE,
+      na.rm = TRUE,
+      type = 7
+    ))
+    return(sort(unique(taus)))
+  }
+
+  km_time <- as.numeric(sf$time)
+  km_surv <- as.numeric(sf$surv)
+
+  if (length(km_time) == 0 || length(km_surv) == 0) {
+    taus <- as.numeric(stats::quantile(
+      event_times,
+      probs = percentiles / 100,
+      names = FALSE,
+      na.rm = TRUE,
+      type = 7
+    ))
+    return(sort(unique(taus)))
+  }
+
+  surv_levels <- seq(from = km_surv[1], to = km_surv[length(km_surv)], length.out = n_bins + 2)[2:(n_bins + 1)]
+
+  taus <- numeric(0)
+  for (s in surv_levels) {
+    # KMBIN (11-01): the first KM time at which the curve is at or below the level, as the Python scripts
+    # (np.searchsorted(-km_surv, -s)); the original findInterval(..., all.inside = TRUE) took one jump earlier
+    idx <- which(km_surv <= s)[1]
+    if (!is.na(idx) && idx <= length(km_time)) {
+      taus <- c(taus, km_time[idx])
+    }
+  }
+
+  if (length(taus) == 0) {
+    taus <- as.numeric(stats::quantile(
+      event_times,
+      probs = percentiles / 100,
+      names = FALSE,
+      na.rm = TRUE,
+      type = 7
+    ))
+  }
+
   sort(unique(taus))
 }
 
@@ -552,7 +682,22 @@ for (file_path in dataset_files) {
     next
   }
 
-  taus <- safe_unique_taus(event_times_train, k)
+  if (binning == "pooled") {
+    # POOLED, as km_landmarks.pooled_taus: percentiles seq(k, <100, k) of the pooled covariate update
+    # times (row start times after each training patient's first row) and the training event times (no censoring times)
+    t0 <- ave(df_train_long$time, df_train_long$pid, FUN = min)
+    meas <- df_train_long$time[df_train_long$time > t0]
+    pooled <- c(meas, event_times_train)
+    probs <- seq(k, 100, by = k); probs <- probs[round(probs, 2) < 100]
+    taus <- sort(unique(as.numeric(stats::quantile(pooled, probs = probs / 100, names = FALSE, type = 7))))
+  } else {
+  taus <- safe_unique_taus(
+    times_all = surv_train$surv_time,
+    events_all = surv_train$event,
+    k_step = k,
+    binning = binning
+  )
+  }
   dbg("Computed taus length:", length(taus))
   dbg("Taus:", paste(sprintf("%.4g", taus), collapse = ", "))
 

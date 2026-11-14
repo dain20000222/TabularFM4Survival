@@ -1,4 +1,15 @@
 # =============================================================================
+# MITRA-CF rerun (2026-10-13): copy of dynamic_mitra_discrete.py
+# with MITRA used directly in context (../mitra_icl.py) instead of AutoGluon's
+# TabularPredictor. Changes, all marked "ICL":
+#   - TabularDataset / TabularPredictor come from ../icl_predictor.py
+#   - no 10,000-row subsample of the training rows (MITRA draws its own
+#     8,192-row context)
+#   - data read from ../data_mean
+# Everything else (splits, time grid, row construction, post-processing,
+# metrics, output files) is unchanged.
+# =============================================================================
+# =============================================================================
 # Dynamic MITRA Survival Analysis Implementation
 # =============================================================================
 # This script performs dynamic survival analysis using MITRA (Model-agnostic 
@@ -14,7 +25,11 @@ import os
 import argparse
 from sklearn.model_selection import train_test_split
 from sklearn.impute import SimpleImputer
-from autogluon.tabular import TabularDataset, TabularPredictor
+import os as _os, sys as _sys  # ICL
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "tmlr_mitra_icl_rerun_10_13"))  # ICL (KMBIN: path from this folder)
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from icl_predictor import TabularDataset, TabularPredictor  # ICL: MITRA in context, no AutoGluon
+MAX_TRAIN_ROWS = float("inf")  # ICL: no subsample; MITRA draws its own 8,192-row context
 import tempfile
 import shutil
 import warnings
@@ -35,6 +50,8 @@ warnings.filterwarnings("ignore")
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Run dynamic MITRA with different k values for landmark quantiles')
 parser.add_argument('--k', type=float, default=20, help='Step size for landmark time percentiles (default: 20)')
+parser.add_argument('--binning', default='km_quantile', choices=['quantile', 'km_quantile', 'pooled'])  # KMBIN (11-01)
+parser.add_argument('--oof_folds', type=int, default=0, help='DOOF: folds of the out-of-fold predictions of the training patients (0: none)')
 args = parser.parse_args()
 
 # =============================================================================
@@ -56,11 +73,11 @@ if torch.cuda.is_available():
 # =============================================================================
 
 # Directory containing longitudinal datasets with time-varying covariates
-data_dir = os.path.join("data_mean")
+data_dir = os.path.join("data_mean")  # KMBIN: this folder
 dataset_files = [f for f in os.listdir(data_dir) if f.endswith(".csv")]
 
 # Output file path for risk prediction results
-risk_out_path = f"dynamic_mitra_discrete_risk_{args.k}.csv"
+risk_out_path = f"dynamic_mitra_discrete_risk_{args.k}" + ("" if args.binning == "quantile" else "_" + args.binning) + ".csv"  # KMBIN
 
 print(f"Total datasets: {len(dataset_files)}")
 print(f"Datasets to process: {dataset_files if dataset_files else 'None'}")
@@ -167,6 +184,50 @@ def hazards_to_survival_df(pids, eval_times, hazard_probs):
     )
     return tmp
 
+
+def dh_oof_rows(train_processed, taus, feature_cols, default_values, quantile_info, time_since, time_col, fit_fn, predict_fn,
+                dataset_name, hyperparameter, n_folds):
+    """DOOF (11-03): out-of-fold survival predictions of the TRAINING patients, for post-hoc calibration
+    (../tmlr_ipcw_loss_10_25/calibrate_dynamic.py). Training patients split into n_folds folds (KFold by patient, seed 42,
+    as dynamic_cf_w.py); each fold predicted by the model fitted on the hazard rows of the other folds (same row
+    construction and the same features as the real fit), at every landmark, for the patients at risk at tau."""
+    from sklearn.model_selection import KFold
+    pids = np.unique(train_processed["pid"])
+    t_event = train_processed.groupby("pid")[time_col].max()
+    rows = []
+    for i_fit, i_pred in KFold(n_folds, shuffle=True, random_state=42).split(pids):
+        fit_df = train_processed[train_processed["pid"].isin(pids[i_fit])]
+        pred_df = train_processed[train_processed["pid"].isin(pids[i_pred])]
+        Xs, ys = [], []
+        for ti in range(len(taus) - 1):
+            X, y = construct_binary_trainset_for_landmark(fit_df, taus[ti], taus[ti:], feature_cols, default_values, taus,
+                                                          quantile_info, time_since, time_col)
+            if len(X) == 0:
+                continue
+            X = X.copy()
+            X["tau"] = float(taus[ti])
+            Xs.append(X)
+            ys.append(y)
+        if not Xs:
+            continue
+        model = fit_fn(pd.concat(Xs, axis=0, ignore_index=True), pd.concat(ys, axis=0, ignore_index=True))
+        for ti in range(len(taus) - 1):
+            tau = float(taus[ti])
+            sub = pred_df[pred_df["pid"].isin(t_event.index[t_event > tau])]
+            X, ppids, times = construct_binary_testset_for_landmark(sub, taus[ti], taus[ti:], feature_cols, default_values, taus,
+                                                                    quantile_info, time_since, time_col)
+            if len(X) == 0:
+                continue
+            X = X.copy()
+            X["tau"] = tau
+            tmp = hazards_to_survival_df(ppids, times, predict_fn(model, X))
+            for p, t, sv in zip(tmp["pid"].to_numpy(), tmp["t"].to_numpy(), tmp["surv_prob"].to_numpy()):
+                if not np.isclose(float(t), tau):
+                    rows.append({"pid": int(p), "tau": tau, "t": float(t), "risk": np.nan, "surv_prob": float(sv),
+                                 "dataset": dataset_name, "hyperparameter": str(hyperparameter), "eval_set": "oof", "k": args.k})
+    print(f"  [DOOF] {len(rows)} out-of-fold survival predictions of {len(pids)} training patients")
+    return rows
+
 def construct_binary_trainset_for_landmark(df, tau, future_times, feature_cols, default_values, taus, quantile_info, time_since, followup_col="time2"):
     """
     Construct binary training dataset for a specific landmark tau.
@@ -197,7 +258,7 @@ def construct_binary_trainset_for_landmark(df, tau, future_times, feature_cols, 
           .groupby("pid")
           .agg(
               t_event=(followup_col, "max"),
-              status_event=("event", "last"),
+              status_event=("event", "max"),
           )
     )
 
@@ -305,7 +366,7 @@ def construct_binary_testset_for_landmark(df, tau, future_times, feature_cols, d
           .groupby("pid")
           .agg(
               t_event=(followup_col, "max"),
-              status_event=("event", "last"),
+              status_event=("event", "max"),
           )
     )
 
@@ -366,6 +427,7 @@ def construct_binary_testset_for_landmark(df, tau, future_times, feature_cols, d
 # Global accumulators for CSV output
 # ============================================================
 all_risk_rows = []
+all_oof_rows = []  # DOOF
 
 # ============================================================
 # Hyperparameter loop
@@ -425,6 +487,12 @@ for hyperparameter in hyperparameters:
         percentiles = [p for p in percentiles if round(p, 2) < 100]
 
         taus = np.percentile(event_times, percentiles)
+        if args.binning == "km_quantile":  # KMBIN: unsmoothed KM-quantile landmarks (km_landmarks.py)
+            from km_landmarks import km_taus
+            taus = km_taus(train_df, time_col_for_tau, args.k)
+        elif args.binning == "pooled":  # POOLED (11-06)
+            from km_landmarks import pooled_taus
+            taus = pooled_taus(train_df, time_col_for_tau, args.k)
         num_eval_times = len(taus)
 
         print(f"Landmarks (taus) from TRAIN: {[f'{t:.6g}' for t in taus]}")
@@ -537,7 +605,7 @@ for hyperparameter in hyperparameters:
         print(f"Training samples (train only, all taus): {len(y_train_all)} (event: {n_ones}, no event: {n_zeros})")
 
         # Sample if too large (MITRA limit: 10000 rows)
-        if len(X_train_all) > 10000:
+        if len(X_train_all) > MAX_TRAIN_ROWS:  # ICL
             print(f"Sampling 10000 rows from {len(X_train_all)} total rows...")
             sample_idx = np.random.choice(len(X_train_all), size=10000, replace=False)
             X_train_all = X_train_all.iloc[sample_idx].reset_index(drop=True)
@@ -557,6 +625,17 @@ for hyperparameter in hyperparameters:
                 train_data,
                 hyperparameters={'MITRA': {'fine_tune': False}}
             )
+            if args.oof_folds:  # DOOF
+                def _fit(X, y):
+                    dfit = pd.DataFrame(X)
+                    dfit["target"] = y
+                    pr = TabularPredictor(label="target", path=tempfile.mkdtemp())
+                    pr.fit(TabularDataset(dfit), hyperparameters={"MITRA": {"fine_tune": False}})
+                    return pr
+                all_oof_rows += dh_oof_rows(train_processed, taus, feature_cols_processed, default_values, quantile_info, time_since,
+                                            time_col_for_tau, _fit,
+                                            lambda pr, X: get_positive_class_probs(pr.predict_proba(TabularDataset(pd.DataFrame(X)))),
+                                            dataset_name, hyperparameter, args.oof_folds)
 
             # -----------------------------
             # For each landmark tau (excluding last tau), run inference using the same model
@@ -577,7 +656,7 @@ for hyperparameter in hyperparameters:
                       .groupby("pid")
                       .agg(
                           t_event=(time_col_for_tau, "max"),
-                          status_event=("event", "last"),
+                          status_event=("event", "max"),
                       )
                 )
                 val_at_risk_pids = val_patient_outcome.index[
@@ -590,7 +669,7 @@ for hyperparameter in hyperparameters:
                       .groupby("pid")
                       .agg(
                           t_event=(time_col_for_tau, "max"),
-                          status_event=("event", "last"),
+                          status_event=("event", "max"),
                       )
                 )
                 test_at_risk_pids = test_patient_outcome.index[
@@ -737,6 +816,11 @@ if len(all_risk_rows) > 0:
     print(f"  Test rows: {test_rows} ({(~results_df[results_df['eval_set']=='test']['risk'].isna()).sum()} risk scores, {(~results_df[results_df['eval_set']=='test']['surv_prob'].isna()).sum()} surv probs)")
 else:
     print("No results to save")
+
+if all_oof_rows:  # DOOF
+    oof_path = risk_out_path.replace("_risk_", "_oof_")
+    pd.DataFrame(all_oof_rows).to_csv(oof_path, index=False)
+    print(f"Out-of-fold predictions saved to: {oof_path}")
 
 print("\nProcessing complete!")
 

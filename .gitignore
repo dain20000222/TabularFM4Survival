@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+# outputs of the run scripts and of the analysis scripts
+static/runs/
+dynamic/runs/
+analysis/out/
+static/static_long.csv
+static/static_calibration_val_bce.csv
+static/static_monotonicity.csv
+static/static_calibration_bcesurv_weights.csv
+static/static_context_sampling.csv
+static/static_classification_metrics.csv
+dynamic/dynamic_long.csv
+dynamic/dynamic_long_tau.csv

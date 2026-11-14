@@ -4,12 +4,17 @@ Official code for the paper **"Tabular Foundation Models Can Do Survival Analysi
 by **Da In Kim, Wei Siang Lai, and Kelly W. Zhang** (Imperial College London).
 
 We cast survival analysis as a sequence of binary classification problems, which
-lets off-the-shelf **tabular foundation models (TFMs)** — such as MITRA and
-TabPFN — perform both **static** and **dynamic** survival analysis through
+lets off-the-shelf **tabular foundation models (TFMs)**, such as MITRA and
+TabPFN, perform both **static** and **dynamic** survival analysis through
 in-context learning, with no survival-specific pretraining. This repository
-reproduces the static and dynamic experiments in the paper.
+contains the code and the results behind the tables and figures of the paper.
 
-📄 Paper: [arXiv:2601.22259](https://arxiv.org/abs/2601.22259) *(under submission)*
+📄 Paper: [arXiv:2601.22259](https://arxiv.org/abs/2601.22259)
+
+> **Versions.** `main` holds the code of the revised paper (54 static and 6 dynamic
+> datasets, weighted cumulative-failure loss, post-hoc calibration). The code of
+> the first arXiv version (43 static and 5 dynamic datasets) is the commit
+> [`b27d69c`](../../tree/b27d69c27a5c39b87822b1aebf838e3dd900000e).
 
 ---
 
@@ -18,150 +23,152 @@ reproduces the static and dynamic experiments in the paper.
 ```
 .
 ├── requirements.txt
-├── static/
-│   ├── static_data/                 # 43 static datasets (CSV)
-│   ├── static_baseline_final.py     # CoxPH, RSF, DeepSurv, DeepHit
-│   ├── static_mitra_final.py         # MITRA-CF   (our classification formulation)
-│   ├── static_tabpfn_final.py        # TabPFN-CF  (our classification formulation)
-│   ├── static_xgboost_final.py       # XGBoost-CF (our classification formulation)
-│   ├── static_mitra_discrete.py      # MITRA-DH   (discrete-time hazard variant)
-│   ├── static_tabpfn_discrete.py     # TabPFN-DH  (discrete-time hazard variant)
-│   ├── static_xgboost_discrete.py    # XGBoost-DH (discrete-time hazard variant)
-│   ├── static_mitra_multiclass.py    # MITRA-MC   (multi-class PMF variant)
-│   ├── static_tabpfn_multiclass.py   # TabPFN-MC  (multi-class PMF variant)
-│   ├── static_xgboost_multiclass.py  # XGBoost-MC (multi-class PMF variant)
-│   └── performance_static.py         # aggregation / metric tables / plots
-└── dynamic/
-    ├── data/                        # 5 dynamic (longitudinal) datasets (CSV)
-    ├── ddh/                         # local Dynamic-DeepHit implementation
-    ├── dynamic_{mitra,tabpfn,xgboost}.py          # -CF variants
-    ├── dynamic_{mitra,tabpfn,xgboost}_discrete.py # -DH variants
-    ├── dynamic_deephit.py           # Dynamic DeepHit
-    ├── landmark_cox.py              # Landmark CoxPH
-    ├── landmark_rsf.py              # Landmark RSF
-    ├── dynamic_jm.R                 # Joint Model (R)
-    ├── metrics.py                   # test metrics from risk CSVs
-    └── metrics_val.py               # validation metrics from risk CSVs
+├── static/                      # static setting (Table 1, Appendix D.2-D.5)
+│   ├── static_data/             # 54 static datasets (CSV, from SurvSet)
+│   ├── run_static.sh            # runs every model, the calibration and the collection of the results
+│   ├── static_cf_w.py           # cumulative-failure (CF) and multi-class (MC) models: MITRA, TabPFN-2.5, XGBoost
+│   ├── static_{mitra,tabpfn,xgboost}_dh_cal.py   # discrete-hazard (DH) models
+│   ├── static_baseline_final.py # CoxPH, RSF, DeepHit, DeepSurv
+│   ├── static_mtlr.py           # MTLR, Neural MTLR
+│   ├── static_bce.py            # MLP BCESurv
+│   ├── calibrate_static.py      # post-hoc calibration with the weights of the CF loss
+│   ├── calibrate_own_loss.py    # post-hoc calibration of the DH / MC models with their own loss
+│   ├── cal_abl.py               # calibration with the BCESurv weights (Figure 5)
+│   ├── monotonicity.py          # monotonicity violations, clipping vs. isotonic regression (Table 7)
+│   ├── mitra_ctx.py             # MITRA-CF with a stratified context (Table 8)
+│   ├── classification_metrics.py# weighted BCE / ROC-AUC of the CF models (Figure 6)
+│   ├── build_static_long.py     # collects the runs into one long table
+│   └── cf_weights.py, classifiers.py, mc_classifier.py, censoring.py,
+│       mitra_icl.py, icl_predictor.py, mitra_lora.py     # shared modules
+├── dynamic/                     # dynamic setting (Table 2)
+│   ├── data/                    # 6 longitudinal datasets (CSV, from SurvSet)
+│   ├── data_mean/               # the same with running means / modes of the covariates (model input)
+│   ├── split/                   # patient ids of the training / validation / test split
+│   ├── run_dynamic.sh           # runs every model, the calibration, the evaluation and the collection
+│   ├── dynamic_cf_w.py          # CF models: MITRA, TabPFN-2.5, XGBoost
+│   ├── dynamic_{mitra,tabpfn,xgboost}_discrete.py   # DH models
+│   ├── landmark_cox.py, landmark_rsf.py             # Landmark CoxPH, Landmark RSF
+│   ├── dynamic_deephit.py (+ ddh/)                  # Dynamic DeepHit
+│   ├── dynamic_tcsa.py (+ tdsurv/)                  # TCSA
+│   ├── dynamic_jm.R                                 # Joint Model (R, JMbayes2)
+│   ├── calibrate_dynamic.py, calibrate_dynamic_own_loss.py
+│   ├── eval_dynamic_w.py, metrics.py, metrics_val.py   # evaluation
+│   ├── build_dynamic_long.py    # collects the evaluation into one long table
+│   └── dynamic_preprocessing_mean.py, make_split.py, km_landmarks.py, ... # preprocessing and shared modules
+├── results/                     # the results behind the paper (one row per model, dataset and K)
+└── analysis/                    # tables and figures of the paper from results/
 ```
 
-**Model naming.** A `-CF` (classification-formulation) suffix denotes a model
-adapted via our direct cumulative-failure reformulation (the `*_final.py`
-scripts). A `-DH` suffix denotes the classical discrete-time hazard variant of
-the same classifier (the `*_discrete.py` scripts). A `-MC` suffix denotes the
-multi-class variant (the `*_multiclass.py` scripts), which predicts a single
-categorical distribution over the discretized time bins (a censoring-conditioned
-PMF whose tail sum recovers the survival function), as used by concurrent work.
+**Model names.** `-CF` is our cumulative-failure formulation, `-DH` the
+discrete-hazard formulation and `-MC` the multi-class formulation of the same
+classifier. In the result files, `Linear MTLR` is the paper's *MTLR*, `BCESurv`
+is *MLP BCESurv*, and `XGBoost-CF (W abl)` is *XGBoost BCESurv* (XGBoost-CF
+trained with the BCESurv weights). A row `<model> + calibration` holds the IBS
+after post-hoc calibration; the C-Index and Integrated AUC are those of the
+uncalibrated model (calibration is used for the IBS only).
 
 ---
 
 ## Installation
 
 ```bash
-git clone https://github.com/dain20000222/TabularFM4Survival.git
-cd TabularFM4Survival
 pip install -r requirements.txt
 ```
 
-Python 3.9 is recommended. The Joint Model baseline (`dynamic/dynamic_jm.R`)
-additionally requires R with the `JM` package (`install.packages("JM")`); the
-Dynamic-DeepHit dependency (`dynamic/ddh/`) is bundled and needs no separate
-installation. A GPU is optional — the foundation-model scripts also run on CPU.
+The paper's runs used three Python environments, because the two TFMs need
+different package versions:
 
-## Data
+| Environment | Used for | Key packages |
+|---|---|---|
+| `PY_MITRA` | MITRA models | `autogluon.tabular==1.4.0` |
+| `PY_TABPFN` | TabPFN-2.5 models | `tabpfn==6.0.6` |
+| `PY_SURV` | all other models, calibration, evaluation, analysis | `scikit-survival==0.21.0`, `numpy==1.26.4`, `xgboost==3.0.5`, `pycox==0.3.0` |
 
-The 43 static and 5 dynamic pre-processed datasets are included under
-`static/static_data/` and `dynamic/data/`. They are derived from
-[**SurvSet**](https://github.com/ErikinBC/SurvSet), an open-source time-to-event
-dataset repository (Drysdale, 2022); please cite SurvSet if you use them.
-
----
-
-## Discretization controls
-
-- `--k` **(`-CF`, `-DH`, and baseline scripts)** : step size (in percent)
-  between evaluation-time percentiles. The number of discrete intervals is
-  `K ≈ round(100 / k)`. The paper reports `K ∈ {5, 10, 15, 20}`:
-
-  | `--k`      | 20 | 10 | 6.6666667 | 5  |
-  |------------|----|----|-----------|----|
-  | `K` (bins) | 5  | 10 | 15        | 20 |
-
-- `--k` **(`-MC` scripts)** : the number of discrete time bins `K` *directly*
-  (an integer, `K ≥ 2`). Here `--k 5` means `K = 5` and `--k 20` means `K = 20`
-  — note this differs from the step-size convention above.
-
-- `--binning` *(`-CF` / `-DH` / baseline scripts)* : bin-boundary placement —
-  `quantile` (default; observed-event-time quantiles), `equal_width`, or
-  `km_quantile` (censoring-aware, from Kaplan–Meier-quantile boundaries).
-  Non-default choices add a `_<binning>` suffix to the output filename. The `-MC`
-  scripts use quantile bin edges only and take no `--binning` flag.
+The run scripts take the python executable of each environment from the
+variables `PY_MITRA`, `PY_TABPFN` and `PY_SURV` (default: `python` for all).
+TCSA additionally needs `jax` (`PY_TCSA`); its reference implementation
+[`tdsurv`](https://github.com/spotify-research/tdsurv) (Apache-2.0) is bundled
+unmodified in `dynamic/tdsurv/`. The Joint Model needs R with `JMbayes2`.
+The MITRA and TabPFN models need a GPU; all other steps run on CPU.
 
 ---
 
-## Usage
+## Running the experiments
 
-### Static experiments
-
-Run from inside `static/` (scripts read `static_data/`):
+### Static setting
 
 ```bash
 cd static
-
-# Our classification formulation (-CF), K=20  (i.e. --k 5)
-python static_mitra_final.py   --k 5
-python static_tabpfn_final.py  --k 5
-python static_xgboost_final.py --k 5
-
-# Discrete-time hazard variants (-DH)
-python static_mitra_discrete.py --k 5
-
-# Multi-class PMF variants (-MC); here --k is K directly, so --k 20 means K=20
-python static_mitra_multiclass.py --k 20
-
-# Classical / neural baselines
-python static_baseline_final.py --k 5 --val_metric ipcw_c_index
-
-# Censoring-aware (Kaplan–Meier-quantile) binning
-python static_mitra_final.py --k 5 --binning km_quantile
+bash run_static.sh                       # every model, K = 5, 10, 15, 20
+MODEL_GROUPS="2 5 8" bash run_static.sh  # only some model groups
+KS="5 10" bash run_static.sh             # only some K
 ```
 
-Each script writes an evaluation CSV with validation and test metrics per
-dataset (e.g. `static_mitra_evaluation_final_5.csv`). Sweep
-`--k ∈ {20, 10, 6.6666667, 5}` for `K ∈ {5, 10, 15, 20}`, then run
-`python performance_static.py` to produce the aggregated tables and
-K-sensitivity plots.
+`run_static.sh` lists the model groups and the command of each model. Every
+group and K runs in its own folder `runs/<group>_K<K>/`. The grid points are
+the quantiles of the Kaplan-Meier estimate of the survival function
+(`--binning km_quantile`); the scripts take the step of the grid in percent,
+`--k = 100 / K`. After the model runs, the script fits the post-hoc
+calibration and collects everything with `build_static_long.py`, which writes
+`static_long.csv` in the format of `results/static_long.csv`.
 
-### Dynamic experiments
-
-Run from inside `dynamic/` (scripts read `data/` and the local `ddh/` module):
+### Dynamic setting
 
 ```bash
 cd dynamic
-
-# Step 1 — generate patient-level risk / survival predictions
-python dynamic_mitra.py   --k 20
-python dynamic_tabpfn.py  --k 20
-python dynamic_xgboost.py --k 20
-python dynamic_deephit.py --k 20
-python landmark_cox.py    --k 20
-python landmark_rsf.py    --k 20
-Rscript dynamic_jm.R
-
-# Step 2 — compute metrics from the risk CSVs
-python metrics.py       # test-set metrics
-python metrics_val.py   # validation-set metrics (for model selection)
+bash run_dynamic.sh                      # every model on the 6 datasets
+MODELS="4 5 6" DATASETS="heart csl" bash run_dynamic.sh
 ```
 
-Each model script evaluates **all** hyperparameter configurations and produces
-`*_risk_<k>.csv`; model selection is deferred to the metric-computation stage.
+Each dataset uses its own number of intervals K (the largest K ≤ 10 with at
+least 5 training events in every interval): aids 6, csl 8, epileptic 7,
+heart 5, oldmort 10, FRTCS 8. `run_dynamic.sh` runs the models, the post-hoc
+calibration and the evaluation, and `build_dynamic_long.py` writes
+`dynamic_long.csv` in the format of `results/dynamic_long.csv`.
+
+### Tables and figures
+
+The scripts of `analysis/` read `results/` and write to `analysis/out/`.
+To use your own runs instead, copy the files written by the two `build_*`
+scripts into `results/` (or set `STATIC_LONG` to another long table).
+
+| Paper | Script | Input |
+|---|---|---|
+| Table 1 | `table1_static.py` | `static_long.csv` |
+| Table 2 | `table2_dynamic.py` | `dynamic_long.csv` |
+| Figure 2 | `fig2_gains_heatmap.py` | `static_long.csv` |
+| Figures 3, 4 | `fig3_fig4_gains_formulations.py` | `static_long.csv`, `static_dataset_rules.csv` |
+| Figure 5 | `fig5_weights.py` | `static_long.csv`, `static_calibration_bcesurv_weights.csv` |
+| Figure 6 | `fig6_correlation.py` | `static_long.csv`, `static_classification_metrics.csv` |
+| Table 6 | `table6_static_by_k.py` | `static_long.csv` |
+| Figure 7 | `fig7_k_sensitivity.py` | `static_long.csv` |
+| Figure 8 | `fig8_calibration_by_k.py` | `static_long.csv` |
+| Table 7 | `table7_monotonicity.py` | `static_monotonicity.csv` |
+| Table 8 | `table8_context_sampling.py` | `static_context_sampling.csv` |
+| Table 9 | `table9_tfm_vs_xgboost.py` | `static_long.csv` |
+
+`results/static_dataset_rules.csv` lists the 69 static SurvSet datasets with
+the three exclusion criteria of the paper (Table 4) and the statistics of the
+54 datasets we use (Table 3).
 
 ---
 
 ## Reproducibility notes
 
-- Random seeds are fixed inside every script (`SEED = 42`).
-- Validation data is used only for hyperparameter selection; test data only for
-  final reporting.
+- Random seeds are fixed inside every script (seed 42), and every model uses
+  the same split of each dataset (70% training, 15% validation, 15% test).
+- Validation data is used only for model selection and calibration; test data
+  only for the reported metrics.
+- The model scripts are the ones that produced the results of the paper; only
+  import paths, comments and the wrapper scripts were adapted to this
+  repository. The files of `results/` are the outputs of those runs.
+- The scripts of `analysis/` reproduce the paper's tables and figures from
+  `results/`.
+- Exact numbers depend on package versions (e.g. the XGBoost models differ
+  slightly between `xgboost` 2.1, 3.0 and later versions, and the random
+  survival forests between `scikit-survival` versions); use the versions of
+  `requirements.txt` to reproduce the paper.
+- The datasets come from [SurvSet](https://github.com/ErikinBC/SurvSet) 0.2.11.
 
 ---
 
@@ -182,4 +189,6 @@ Each model script evaluates **all** hyperparameter configurations and produces
 
 This code is released under the MIT License; see [`LICENSE`](LICENSE) for details.
 The bundled datasets are derived from [SurvSet](https://github.com/ErikinBC/SurvSet)
-and remain subject to their original terms.
+and remain subject to their original terms. `dynamic/tdsurv/` is the reference
+implementation of TCSA by Spotify, Inc., licensed under Apache-2.0
+(see `dynamic/tdsurv/LICENSE`).
